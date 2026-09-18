@@ -93,7 +93,9 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     d = model.choose(page(), "Find a book", [])
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
-    assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target"}
+    assert set(calls[0]["questions"]) == {
+        "operation", "click_target", "type_text_target", "goal_met", "progress"
+    }
 
 
 def test_click_cannot_consume_a_text_target(monkeypatch):
@@ -162,6 +164,7 @@ def runner():
     a = loop.Agent.__new__(loop.Agent)
     a.screenshots = False
     a.pending_text = None
+    a.data = {}
     p = page()
     a.state = {
         "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
@@ -310,6 +313,70 @@ def test_text_helper_rejects_invalid_values(monkeypatch, content):
     monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": content}}]}))
     with pytest.raises(ValueError, match="nothing typed"):
         model.field_text({"goal": "Find a flight"})
+
+
+def test_reveal_action_is_parked_after_three_weak_outcomes():
+    state = page()
+    state["actions"].append(
+        {"id": "reveal1", "kind": "reveal", "label": "必須欄を表示: 種別", "node": 40}
+    )
+    history = [
+        {"action": "必須欄を表示: 種別", "outcome": "same_url_changed", "kind": "reveal"}
+        for _ in range(3)
+    ]
+    legal = model.filtered_actions(state, history)
+    assert all(a["kind"] != "reveal" for a in legal)
+
+
+def test_stale_rejection_is_recorded_and_parks_the_action(runner):
+    runner.state["browser"].act.side_effect = StalePage("changed")
+    runner.state["decision"] = decision("e3")
+    with pytest.raises(StalePage):
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["history"][-1]["action"] == "Go"
+    assert runner.state["history"][-1]["outcome"] == "stale"
+    for _ in range(2):
+        runner.state["decision"] = decision("e3")
+        with pytest.raises(StalePage):
+            runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    legal = model.filtered_actions(runner.state["page"], runner.state["history"])
+    assert all(a["id"] != "e3" for a in legal)
+
+
+def test_five_stale_rejections_block_the_run(runner):
+    runner.state["browser"].act.side_effect = StalePage("changed")
+    for _ in range(5):
+        runner.state["decision"] = decision("e3")
+        with pytest.raises(StalePage):
+            runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+
+
+def test_blocking_overlay_limits_choices_to_dismiss_or_wait():
+    state = page()
+    state["overlay"] = "modalWindow"
+    state["actions"].append(
+        {"id": "dismiss_overlay", "kind": "dismiss", "label": "閉じる: 画面を覆うオーバーレイ", "node": 50}
+    )
+    legal = model.filtered_actions(state, [])
+    assert {a["id"] for a in legal} == {"dismiss_overlay", "wait"}
+
+
+def test_rescue_never_chooses_a_parked_action(monkeypatch):
+    state = page()
+    state["actions"] = [
+        {"id": "reveal1", "kind": "reveal", "label": "必須欄を表示: 種別", "node": 40}
+    ]
+    state["required_empty"] = ["種別"]
+    history = [
+        {"action": "必須欄を表示: 種別", "outcome": "same_url_changed", "kind": "reveal"}
+        for _ in range(3)
+    ]
+    post = Mock()
+    monkeypatch.setenv("RESCUE_MODEL_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    assert model.rescue_decision(state, "Fill the form", history) is None
+    post.assert_not_called()
 
 
 def test_navigation_during_prediction_reobserves_without_action(runner):
