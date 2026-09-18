@@ -7,10 +7,10 @@ import time
 from pathlib import Path
 
 from browser_harness.admin import ensure_daemon
-from browser_harness.helpers import cdp
+from browser_harness.helpers import _send, cdp
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
-READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
+READ_STATE = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8")
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
 class StalePage(ValueError):
@@ -42,6 +42,9 @@ class Browser:
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
+        # A native dialog freezes the renderer; check before any page JS runs.
+        if _send({"meta": "pending_dialog"}).get("dialog"):
+            self.after_input = None
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
@@ -72,10 +75,44 @@ class Browser:
                     awaitPromise=True,
                     returnByValue=True,
                 )
-            except RuntimeError:
+            except Exception:
                 pass
         for attempt in range(10):
             try:
+                # A native dialog freezes the renderer, so the DOM snapshot below
+                # cannot run while one is open. Expose it as the state instead:
+                # the only legal actions become accept/dismiss.
+                dialog = _send({"meta": "pending_dialog"}).get("dialog")
+                if dialog:
+                    return {
+                        "url": "",
+                        "title": "native dialog",
+                        "w": 0,
+                        "h": 0,
+                        "text": dialog.get("message", ""),
+                        "scroll": {"y": 0, "height": 0},
+                        "actions": [
+                            {
+                                "id": "dialog_accept",
+                                "kind": "dialog",
+                                "accept": True,
+                                "label": f"Accept the {dialog.get('type', 'dialog')} dialog",
+                            },
+                            {
+                                "id": "dialog_dismiss",
+                                "kind": "dialog",
+                                "accept": False,
+                                "label": f"Dismiss the {dialog.get('type', 'dialog')} dialog",
+                            },
+                        ],
+                        "locked": [],
+                        "dialog": dialog,
+                        "marker": ("dialog", dialog.get("type"), dialog.get("message")),
+                        "page_key": None,
+                        "guards": {},
+                        "omitted_actions": 0,
+                        "fingerprint": "dialog:" + str(dialog.get("message", "")),
+                    }
                 return browser_operation(
                     {"operation": "observe", "session": self.session, "screenshot": screenshot}
                 )
@@ -86,6 +123,14 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
+        # A pending native dialog freezes the renderer; Runtime.evaluate would
+        # time out. The DOM cannot change while frozen, so it is "fresh" — the
+        # next observe() exposes the accept/dismiss choices.
+        if _send({"meta": "pending_dialog"}).get("dialog"):
+            return True
+        if page.get("dialog"):
+            # Dialog state has no DOM marker; presence was just confirmed.
+            return True
         if action is not None and action["kind"] in {"click", "select"}:
             node = action["node"]
             if type(node) is not int:
@@ -102,7 +147,30 @@ class Browser:
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
-        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
+        if action["kind"] == "dialog":
+            # Answering the dialog is a browser-level operation, not a DOM input.
+            # Page.enable can queue behind the frozen renderer, so answer first.
+            try:
+                return self.call(
+                    "Page.handleJavaScriptDialog", accept=bool(action.get("accept"))
+                )
+            except Exception:
+                self.call("Page.enable")
+                return self.call(
+                    "Page.handleJavaScriptDialog", accept=bool(action.get("accept"))
+                )
+        try:
+            result = browser_operation(
+                {"operation": "act", "session": self.session, "action": action, "text": text}
+            )
+        except Exception:
+            # A click that opens a native dialog freezes the renderer mid-call;
+            # the daemon then times out. If a dialog is now pending, the input
+            # did execute — the next observe() exposes accept/dismiss choices.
+            if _send({"meta": "pending_dialog"}).get("dialog"):
+                result = {"executed": action["id"]}
+            else:
+                raise
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -136,7 +204,47 @@ def browser_operation(request):
         action = request["action"]
         kind = action["kind"]
         if kind == "scroll":
-            call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+            # Scroll the same region the snapshot measured: the largest
+            # scrollable container, or the window when none qualifies.
+            evaluate("""(delta => {
+              let best=null, room=0;
+              for (const e of document.body.querySelectorAll('*')) {
+                const r=e.scrollHeight-e.clientHeight;
+                if (r>room && e.clientHeight>200 &&
+                    ['auto','scroll'].includes(getComputedStyle(e).overflowY)) { room=r; best=e; }
+              }
+              if (best) best.scrollTop+=delta; else scrollBy(0,delta);
+              return true;
+            })(""" + json.dumps(action["delta"]) + ")")
+        elif kind == "reveal":
+            # Targeted scroll: bring an observed-but-off-screen node into view.
+            # No mutation, so no hit test — the element is off-screen by design.
+            ok = evaluate(
+                """(action => {
+                  const e=window.__jevFast?.nodes.get(action.node);
+                  if (!e?.isConnected) return false;
+                  e.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
+                  return true;
+                })(""" + json.dumps(action) + ")"
+            )
+            if not ok:
+                raise StalePage("Reveal target disappeared. Observe again.")
+            return {"executed": action["id"]}
+        elif kind == "dismiss":
+            # A stuck full-viewport overlay with no dialog open: hiding the
+            # observed node is the deterministic unmask. Never invented — the
+            # node id comes from the snapshot's own overlay detection.
+            ok = evaluate(
+                """(action => {
+                  const e=window.__jevFast?.nodes.get(action.node);
+                  if (!e?.isConnected) return false;
+                  e.style.display='none';
+                  return true;
+                })(""" + json.dumps(action) + ")"
+            )
+            if not ok:
+                raise StalePage("Overlay target disappeared. Observe again.")
+            return {"executed": action["id"]}
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -146,7 +254,12 @@ def browser_operation(request):
               if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
                   !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-              const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
+              let r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
+              if (r.width && r.height && x>=0 && y>=0 && x<innerWidth && y<innerHeight &&
+                  !e.contains(document.elementFromPoint(x,y))) {
+                e.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
+                r=e.getBoundingClientRect(); x=r.x+r.width/2; y=r.y+r.height/2;
+              }
               if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
               if (!e.contains(document.elementFromPoint(x,y))) return null;
               if (action.kind==='select') {
@@ -156,7 +269,7 @@ def browser_operation(request):
                 e.dispatchEvent(new Event('input',{bubbles:true}));
                 e.dispatchEvent(new Event('change',{bubbles:true}));
               }
-              return {x,y};
+              return {x,y,node:action.node};
             })(""" + json.dumps(action) + ")")
             if target is None:
                 if kind == "select":
@@ -183,6 +296,15 @@ def browser_operation(request):
                         modifiers=4 if sys.platform == "darwin" else 2,
                     )
                     call("Input.insertText", text=request["text"])
+        # Report the applied value so history can record whether input took
+        # effect (silent truncation by maxlength leaves no other signal).
+        if kind in {"fill", "select"}:
+            value_after = evaluate(
+                "(() => { const e=window.__jevFast?.nodes.get(" + json.dumps(action["node"]) + "); "
+                "return e ? (e.tagName==='SELECT' ? [...e.selectedOptions].map(o=>o.label).join(', ') "
+                ": String(e.value ?? '')) : null; })()"
+            )
+            return {"executed": action["id"], "value_after": value_after}
         return {"executed": action["id"]}
 
     info = evaluate(READ_STATE)
